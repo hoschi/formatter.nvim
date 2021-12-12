@@ -4,9 +4,20 @@ local util = require "formatter.util"
 
 local M = {}
 
-function M.format(args, mods, startLine, endLine, write)
+local noop = function()
+end
+
+M.statusCodes = {
+  DONE='DONE',
+  SAVING='SAVING',
+  NOTHING_TO_DO='NOTHING_TO_DO',
+  BUFFER_CHANGED='BUFFER_CHANGED'
+}
+
+function M.format(args, mods, startLine, endLine, write, callbackArg)
+  local callback = callbackArg or noop
   if M.saving then
-    return
+    return callback(false, M.statusCodes.SAVING)
   end
   util.mods = mods
   startLine = startLine - 1
@@ -17,13 +28,14 @@ function M.format(args, mods, startLine, endLine, write)
 
   if not modifiable then
     util.print("Buffer is not modifiable")
-    return
+    return callback(true, "Buffer is not modifiable")
   end
 
   -- No formatters defined for the given file type
   if util.isEmpty(formatters) then
-    util.err(string.format("No formatter defined for %s files", filetype))
-    return
+    local err = string.format("No formatter defined for %s files", filetype)
+    util.err(err)
+    return callback(true, err)
   end
   local configsToRun = {}
   for _, val in ipairs(formatters) do
@@ -32,10 +44,10 @@ function M.format(args, mods, startLine, endLine, write)
       table.insert(configsToRun, {config = tmp, name = tmp.exe})
     end
   end
-  M.startTask(configsToRun, startLine, endLine, write)
+  M.startTask(configsToRun, startLine, endLine, write, callback)
 end
 
-function M.startTask(configs, startLine, endLine, format_then_write)
+function M.startTask(configs, startLine, endLine, format_then_write, callback)
   local F = {}
   local bufnr = api.nvim_get_current_buf()
   local bufname = api.nvim_buf_get_name(bufnr)
@@ -50,7 +62,7 @@ function M.startTask(configs, startLine, endLine, format_then_write)
   local tempfiles = {}
   if buf_skip_format then
     util.print("Formatting turn off for buffer")
-    return
+    return callback(false, M.statusCodes.NOTHING_TO_DO)
   end
   function F.on_event(job_id, data, event)
     if event == "stdout" then
@@ -98,7 +110,7 @@ function M.startTask(configs, startLine, endLine, format_then_write)
   function F.run(current)
     if inital_changedtick ~= vim.api.nvim_buf_get_changedtick(bufnr) then
       util.print("Buffer changed while formatting, skipping")
-      return
+      return callback(false, M.statusCodes.BUFFER_CHANGED)
     end
 
     name = current.name
@@ -111,8 +123,9 @@ function M.startTask(configs, startLine, endLine, format_then_write)
     end
 
     if current.config.stdin == nil then
-      util.print(string.format("Stdin option is not set for %s. Please set stdin to either true or false", name))
-      return
+	  local err = string.format("Stdin option is not set for %s. Please set stdin to either true or false", name)
+      util.print(err)
+      return callback(true, err)
     end
 
     local job_options = {
@@ -149,25 +162,23 @@ function M.startTask(configs, startLine, endLine, format_then_write)
   -- do not play well together
   function F.step()
     if #configs == 0 then
-      F.done()
-      return
+      return F.done()
     end
-    F.run(table.remove(configs, 1))
+    return F.run(table.remove(configs, 1))
   end
 
   function F.done()
     if inital_changedtick ~= vim.api.nvim_buf_get_changedtick(bufnr) then
       util.print("Buffer changed while formatting, not applying formatting")
-      return
+      return callback(false, M.statusCodes.BUFFER_CHANGED)
     end
 
     if not util.isSame(input, output) then
       local view = vim.fn.winsaveview()
       if not output then
-        util.err(
-          string.format("Formatter: Formatted code not found. You may need to change the stdin setting of %s.", name)
-        )
-        return
+		local err = string.format("Formatter: Formatted code not found. You may need to change the stdin setting of %s.", name)
+        util.err( err)
+        return callback(true, err)
       end
       util.setLines(bufnr, startLine, endLine, output)
       vim.fn.winrestview(view)
@@ -179,16 +190,18 @@ function M.startTask(configs, startLine, endLine, format_then_write)
       end
     else
       util.log(string.format("No change necessary with %s", name))
+	  util.fireEvent("FormatterPost")
+	  return callback(false, M.statusCodes.NOTHING_TO_DO)
     end
 
     util.fireEvent("FormatterPost")
-    return
+    return callback(false, M.statusCodes.DONE)
   end
 
   -- AND start the loop
 
   util.fireEvent("FormatterPre")
-  F.step()
+  return F.step()
 end
 
 return M
